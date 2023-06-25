@@ -47,4 +47,4 @@ rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
 # download with continue / this should be a no-op if the file already exists
-curl "$DOWNLOAD_URL" -O | tar -xf - -C "$OUTPUT_DIR"
+curl "$DOWNLOAD_URL" | tar -xzf - -C "$OUTPUT_DIR"
