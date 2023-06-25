@@ -9,12 +9,14 @@ from cog import BasePredictor, Input, Path
 from diffusers import (
     StableDiffusionPipeline,
     StableDiffusionImg2ImgPipeline,
-    PNDMScheduler,
-    LMSDiscreteScheduler,
     DDIMScheduler,
-    EulerDiscreteScheduler,
-    EulerAncestralDiscreteScheduler,
     DPMSolverMultistepScheduler,
+    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
+    HeunDiscreteScheduler,
+    LMSDiscreteScheduler,
+    PNDMScheduler,
+    UniPCMultistepScheduler,
 )
 from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
@@ -23,6 +25,7 @@ from PIL import Image
 from transformers import CLIPFeatureExtractor
 import shutil
 import subprocess
+from diffusers.utils import load_image
 
 SAFETY_MODEL_CACHE = "diffusers-cache"
 SAFETY_MODEL_ID = "CompVis/stable-diffusion-safety-checker"
@@ -30,11 +33,32 @@ SAFETY_MODEL_ID = "CompVis/stable-diffusion-safety-checker"
 DEFAULT_HEIGHT = 512
 DEFAULT_WIDTH = 512
 DEFAULT_SCHEDULER = "DDIM"
+DEFAULT_GUIDANCE_SCALE = 7.5
+DEFAULT_NUM_INFERENCE_STEPS = 50
+DEFAULT_STRENGTH = 0.8
 
 # grab instance_prompt from weights,
 # unless empty string or not existent
 
 DEFAULT_PROMPT = "a photo of an astronaut riding a horse on mars"
+
+
+class KerrasDPM:
+    def from_config(config):
+        return DPMSolverMultistepScheduler.from_config(config, use_karras_sigmas=True)
+
+
+SCHEDULERS = {
+    "DDIM": DDIMScheduler,
+    "DPMSolverMultistep": DPMSolverMultistepScheduler,
+    "HeunDiscrete": HeunDiscreteScheduler,
+    "KerrasDPM": KerrasDPM,
+    "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler,
+    "K_EULER": EulerDiscreteScheduler,
+    "KLMS": LMSDiscreteScheduler,
+    "PNDM": PNDMScheduler,
+    "UniPCMultistep": UniPCMultistepScheduler,
+}
 
 
 class Predictor(BasePredictor):
@@ -106,53 +130,53 @@ class Predictor(BasePredictor):
             feature_extractor=self.txt2img_pipe.feature_extractor,
         ).to("cuda")
         print("Loaded pipelines in {:.2f} seconds".format(time.time() - start_time))
+
+        self.txt2img_pipe.set_progress_bar_config(disable=True)
+        self.img2img_pipe.set_progress_bar_config(disable=True)
         self.url = url
 
     def generate_images(self, images, output_dir):
         with torch.autocast("cuda"), torch.inference_mode():
-            pipeline = self.txt2img_pipe
-            pipeline.set_progress_bar_config(disable=True)
             for info in tqdm(images, desc="Generating samples"):
                 inputs = info.get("input") or info.get("inputs")
                 name = info["name"]
-                prompt = inputs["prompt"]
-                negative_prompt = inputs.get("negative_prompt")
-                width = int(inputs.get("width", 512))
-                height = int(inputs.get("height", 512))
-                num_outputs = int(inputs.get("num_outputs", 1))
-                disable_safety_check = bool(
-                    inputs.get("disable_safety_check", False)
-                )
-                num_inference_steps = int(inputs.get("num_inference_steps", 50))
-                guidance_scale = float(inputs.get("guidance_scale", 7.5))
-                scheduler = inputs.get("scheduler", "DDIM")
-                seed = inputs.get("seed")
-                if seed is None:
-                    seed = int.from_bytes(os.urandom(2), "big")
-                else:
-                    seed = int(seed)
+                print(name)
 
-                pipeline.scheduler = make_scheduler(
-                    scheduler, pipeline.scheduler.config
-                )
-                if disable_safety_check:
+                num_outputs = int(inputs.get("num_outputs", 1))
+
+                kwargs = {
+                    "prompt": [inputs["prompt"]] * num_outputs,
+                    "num_inference_steps": int(inputs.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS)),
+                    "guidance_scale": float(inputs.get("guidance_scale", DEFAULT_GUIDANCE_SCALE)),
+                }
+
+                image = inputs.get("image")
+                if image is not None:
+                    kwargs['image'] = load_image(image)
+                    kwargs['strength'] = float(inputs.get('strength', DEFAULT_STRENGTH))
+                    pipeline = self.img2img_pipe
+                else:
+                    pipeline = self.txt2img_pipe
+                    kwargs["width"] = int(inputs.get("width", DEFAULT_WIDTH))
+                    kwargs["height"] = int(inputs.get("height", DEFAULT_HEIGHT))
+
+                negative_prompt = inputs.get("negative_prompt")
+                if negative_prompt is not None:
+                    kwargs["negative_prompt"] = [negative_prompt] * num_outputs
+
+                scheduler = inputs.get("scheduler", DEFAULT_SCHEDULER)
+                pipeline.scheduler = SCHEDULERS[scheduler].from_config(pipeline.scheduler.config)
+
+                if bool(inputs.get("disable_safety_check", False)):
                     pipeline.safety_checker = None
                 else:
                     pipeline.safety_checker = self.safety_checker
 
+                seed = int(inputs.get("seed", int.from_bytes(os.urandom(2), "big")))
                 generator = torch.Generator("cuda").manual_seed(seed)
                 output = pipeline(
-                    prompt=[prompt] * num_outputs
-                    if prompt is not None
-                    else None,
-                    negative_prompt=[negative_prompt] * num_outputs
-                    if negative_prompt is not None
-                    else None,
-                    guidance_scale=guidance_scale,
                     generator=generator,
-                    num_inference_steps=num_inference_steps,
-                    width=width,
-                    height=height,
+                    **kwargs,
                 )
 
                 for i, image in enumerate(output.images):
@@ -196,14 +220,3 @@ class Predictor(BasePredictor):
             print(file_path)
             results.append(file_path)
         return results
-
-
-def make_scheduler(name, config):
-    return {
-        "PNDM": PNDMScheduler.from_config(config),
-        "KLMS": LMSDiscreteScheduler.from_config(config),
-        "DDIM": DDIMScheduler.from_config(config),
-        "K_EULER": EulerDiscreteScheduler.from_config(config),
-        "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler.from_config(config),
-        "DPMSolverMultistep": DPMSolverMultistepScheduler.from_config(config),
-    }[name]
